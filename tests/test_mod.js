@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { register } from '../hooks/register.js';
+import { register, summarizeOutput, __resetModState } from '../hooks/register.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -222,6 +222,217 @@ console.log('loader hygiene (static scan)');
   }
   ok(src.includes("export function register"), 'exports register as ESM');
   ok(!src.includes('<') || !src.match(/<[A-Z][a-zA-Z]*\s/), 'no JSX in source');
+}
+
+function resultHandler() {
+  const h = (handlers['tool.result'] || [])[0];
+  if (!h) throw new Error('no tool.result handler registered');
+  return h.handler;
+}
+function genericCallHandler() {
+  const h = (handlers['tool.call'] || []).find((x) => x.matcher === undefined);
+  if (!h) throw new Error('no matcher-less tool.call handler registered');
+  return h.handler;
+}
+
+// Feed a TodoWrite event, optionally a tool.result event, then render.
+async function runWithOutput(todos, toolResultEvent) {
+  __resetModState();
+  const { $, calls } = makeDollar();
+  const next = async (e) => ({ __next: true, e });
+  await toolCallHandler()($, { tool: 'TodoWrite', input: { todos } }, next);
+  if (toolResultEvent !== null) await resultHandler()($, toolResultEvent, next);
+  const { $: $2 } = makeDollar();
+  const tree = await renderHandler()($2, { component: 'AbovePrompt' }, next);
+  return { text: textOf(tree), calls, passthrough: tree && tree.__next === true };
+}
+
+// ---- v0.2 fixtures: long, noisy tool outputs ----
+
+function pytestLog() {
+  const lines = [];
+  for (let i = 0; i < 214; i++)
+    lines.push('tests/test_thing.py::test_case_' + i + ' PASSED');
+  lines.push('tests/test_thing.py::test_edge_a FAILED');
+  lines.push('tests/test_thing.py::test_edge_b FAILED');
+  lines.push('');
+  lines.push(
+    '=========================== short test summary info ============================'
+  );
+  lines.push('FAILED tests/test_thing.py::test_edge_a - assert 1 == 2');
+  lines.push('FAILED tests/test_thing.py::test_edge_b - assert 3 == 4');
+  lines.push('2 failed, 214 passed in 12.34s');
+  return lines.join('\n');
+}
+
+function jestLog() {
+  const lines = ['PASS src/a.test.js', 'PASS src/b.test.js'];
+  for (let i = 0; i < 39; i++) lines.push('  ✓ case ' + i + ' (5 ms)');
+  lines.push('Test Suites: 2 passed, 2 total');
+  lines.push('Tests:       41 passed, 41 total');
+  lines.push('Snapshots:   0 written, 12 passed, 12 total');
+  lines.push('Time:        3.21 s');
+  return lines.join('\n');
+}
+
+function diffLog() {
+  const lines = [
+    'diff --git a/package-lock.json b/package-lock.json',
+    'index abc123..def456 100644',
+    '--- a/package-lock.json',
+    '+++ b/package-lock.json',
+  ];
+  for (let i = 0; i < 300; i++) {
+    lines.push('-    "old-dep-' + i + '": "1.0.0",');
+    lines.push('+    "new-dep-' + i + '": "2.0.0",');
+  }
+  lines.push(
+    'diff --git a/src/index.js b/src/index.js',
+    '--- a/src/index.js',
+    '+++ b/src/index.js',
+    '@@ -1,3 +1,4 @@',
+    '-const a = 1;',
+    '+const a = 2;',
+    '+const b = 3;'
+  );
+  return lines.join('\n');
+}
+
+console.log('v0.2 registration');
+ok(typeof summarizeOutput === 'function', 'summarizeOutput is exported');
+ok(typeof __resetModState === 'function', '__resetModState test seam is exported');
+ok((handlers['tool.result'] || []).length > 0, 'hooks tool.result');
+ok(
+  (handlers['tool.call'] || []).some((x) => x.matcher === undefined),
+  'hooks tool.call without matcher (tool-name recorder)'
+);
+
+console.log('summarize: long pytest log');
+{
+  const s = summarizeOutput('Bash', pytestLog());
+  ok(
+    s && s.text.includes('214 passed') && s.text.includes('2 failed'),
+    'counts 214 passed, 2 failed (got: ' + (s && s.text) + ')'
+  );
+  ok(
+    s && s.text.includes('tests/test_thing.py::test_edge_a FAILED'),
+    'first failure line included'
+  );
+  ok(s && s.text.length <= 220, 'summary within 220 chars');
+}
+
+console.log('summarize: all-pass log');
+{
+  const s = summarizeOutput('Bash', jestLog());
+  ok(s && s.text.includes('41 passed'), 'counts 41 passed (got: ' + (s && s.text) + ')');
+  ok(s && !/failed/i.test(s.text), 'no failure mention when all pass');
+}
+
+console.log('summarize: short output passes through');
+{
+  const s = summarizeOutput('Bash', 'done\nall good');
+  ok(s && s.text === 'done all good', 'short output shown as-is, one line');
+}
+
+console.log('summarize: JSON skeleton');
+{
+  const big = JSON.stringify({
+    status: 'ok',
+    results: Array.from({ length: 300 }, (_, i) => ({ id: i })),
+    total: 300,
+  });
+  ok(big.length > 600, 'fixture is long enough to trigger summarization');
+  const s = summarizeOutput('WebFetch', big);
+  ok(
+    s && s.text.includes('[...300 items]'),
+    'arrays collapse to item counts (got: ' + (s && s.text) + ')'
+  );
+  ok(s && s.text.includes('status'), 'top-level keys preserved');
+}
+
+console.log('summarize: diff lockfile noise');
+{
+  const s = summarizeOutput('Bash', diffLog());
+  ok(s && s.text.includes('src/index.js'), 'non-lockfile file listed');
+  ok(
+    s && /lockfile/.test(s.text) && /hidden/.test(s.text),
+    'lockfile churn collapsed (got: ' + (s && s.text) + ')'
+  );
+  ok(s && !s.text.includes('old-dep-150'), 'raw lockfile lines not leaked');
+}
+
+console.log('summarize: failure detail truncation');
+{
+  const s = summarizeOutput('Bash', 'FAILED ' + 'x'.repeat(5000));
+  ok(s && s.text.includes('…'), 'long failure detail truncated with ellipsis');
+  ok(s && s.text.length <= 220, 'truncated summary within 220 chars');
+}
+
+console.log('render integration: summary under bar');
+{
+  const todos = [T('Write tests', 'in_progress', 'Writing tests'), T('Ship', 'pending')];
+  const { text } = await runWithOutput(todos, { tool: 'Bash', output: pytestLog() });
+  ok(text.includes('░░░░░░░░░░'), 'bar still drawn');
+  ok(text.includes('⏷'), 'summary marker drawn under the bar');
+  ok(text.includes('214 passed'), 'summary text rendered (got: ' + text + ')');
+  ok(text.includes('Bash'), 'tool name labels the summary');
+}
+
+console.log('render integration: no summary, bar only');
+{
+  const todos = [T('Write tests', 'in_progress', 'Writing tests')];
+  const { text } = await runWithOutput(todos, null);
+  ok(text.includes('Writing tests'), 'bar drawn');
+  ok(!text.includes('⏷'), 'no summary marker without tool output');
+}
+
+console.log('render integration: latest summary wins');
+{
+  const todos = [T('Write tests', 'in_progress')];
+  __resetModState();
+  const { $ } = makeDollar();
+  const next = async (e) => ({ __next: true, e });
+  await toolCallHandler()($, { tool: 'TodoWrite', input: { todos } }, next);
+  await resultHandler()($, { tool: 'Bash', output: 'first output' }, next);
+  await resultHandler()($, { tool: 'Bash', output: 'second output' }, next);
+  const { $: $2 } = makeDollar();
+  const text = textOf(await renderHandler()($2, { component: 'AbovePrompt' }, next));
+  ok(
+    text.includes('second output') && !text.includes('first output'),
+    'most recent tool output wins'
+  );
+}
+
+console.log('render integration: tool name from tool.call when result is unnamed');
+{
+  const todos = [T('Write tests', 'in_progress')];
+  __resetModState();
+  const { $ } = makeDollar();
+  const next = async (e) => ({ __next: true, e });
+  await toolCallHandler()($, { tool: 'TodoWrite', input: { todos } }, next);
+  await genericCallHandler()($, { tool: 'Bash', input: { command: 'npm test' } }, next);
+  await resultHandler()($, { output: 'all green' }, next); // no tool field
+  const { $: $2 } = makeDollar();
+  const text = textOf(await renderHandler()($2, { component: 'AbovePrompt' }, next));
+  ok(text.includes('Bash'), 'summary labeled with tool name from tool.call');
+}
+
+console.log('malformed tool.result is fail-open');
+{
+  __resetModState();
+  const { $, calls } = makeDollar();
+  const next = async (e) => ({ __next: true });
+  const res = await resultHandler()($, { tool: 'Bash' }, next); // no output field
+  ok(res.__next === true, 'malformed tool.result still calls next(e)');
+  ok(calls.invalidate.length === 0, 'no invalidate without output');
+  ok(summarizeOutput('Bash', '') === null, 'empty output summarizes to null');
+}
+
+console.log('invalidate on tool.result capture');
+{
+  const todos = [T('A', 'pending')];
+  const { calls } = await runWithOutput(todos, { tool: 'Bash', output: 'hello' });
+  ok(calls.invalidate.includes('ui.render'), "tool.result capture calls $.ui.invalidate('ui.render')");
 }
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');

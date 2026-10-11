@@ -1,1 +1,1 @@
-{"description":"Claude Code mod: live TodoWrite progress bar above the prompt. Zero dependencies.","name":"task-progress-mod","scripts":{"test":"node tests/test_mod.js"},"type":"module","version":"0.1.0"}
+{"description":"Claude Code mod: live TodoWrite progress bar above the prompt, with tool-output summarization. Zero dependencies.","name":"task-progress-mod","scripts":{"test":"node tests/test_mod.js"},"type":"module","version":"0.2.0"}
